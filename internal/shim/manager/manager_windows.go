@@ -118,8 +118,14 @@ func (manager) Start(ctx context.Context, id string, opts shim.StartOpts) (_ shi
 			cmd.Process.Kill()
 		}
 	}()
-	// make sure to wait after start
-	go cmd.Wait()
+
+	// Capture the shim exit error so we can detect an early crash while
+	// waiting for the pipe. The channel is buffered so the goroutine never
+	// blocks even if we return before reading from it.
+	shimExit := make(chan error, 1)
+	go func() {
+		shimExit <- cmd.Wait()
+	}()
 
 	if err = shim.WritePidFile("shim.pid", cmd.Process.Pid); err != nil {
 		return params, err
@@ -134,16 +140,23 @@ func (manager) Start(ctx context.Context, id string, opts shim.StartOpts) (_ shi
 		conn, err := winio.DialPipe(address, nil)
 		if err == nil {
 			conn.Close()
-			break
+			params.Address = address
+			return params, nil
 		}
 		if !os.IsNotExist(err) {
 			return params, fmt.Errorf("waiting for shim pipe %s: %w", address, err)
 		}
+		// If the shim exited before creating the pipe, report its exit
+		// error immediately rather than continuing to poll until timeout.
+		select {
+		case exitErr := <-shimExit:
+			return params, fmt.Errorf("shim exited before creating pipe: %w", exitErr)
+		default:
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	params.Address = address
-	return params, nil
+	return params, fmt.Errorf("timed out waiting for shim pipe %s", address)
 }
 
 func (manager) Stop(ctx context.Context, id string) (shim.StopStatus, error) {
